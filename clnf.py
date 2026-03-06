@@ -149,7 +149,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--removed_factors', type=str, nargs='+', default=[], help='Factors to remove from the dataset. Options: floor_hue, wall_hue, object_hue, scale, shape, orientation')
     parser.add_argument('--predicted_factors', type=str, nargs='+', default=[], help='Factors to predict from the dataset. Options: floor_hue, wall_hue, object_hue, scale, shape, orientation')
-    
+    parser.add_argument('--cut_factors', type=str, nargs='+', default=[], help='Factors to cut from the dataset. Options: floor_hue, wall_hue, object_hue, scale, shape, orientation')
+
     parser.add_argument('ckpt_predictor', type=str, help='Path to pretrained predictor checkpoint')
     parser.add_argument('ckpt_autoencoder', type=str, help='Path to pretrained autoencoder checkpoint')
     # flow parameters
