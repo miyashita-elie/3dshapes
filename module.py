@@ -366,6 +366,8 @@ class CLNF(torch.nn.Module):
         ckpt_autoencoder,
         flow_layers=24,
         flow_hidden_dim=192,
+        hom_layers=24,
+        hom_hidden_dim=192,
         scale_map="exp_clamp",
         num_bases_sym=None,
         num_bases_null=None,
@@ -409,6 +411,22 @@ class CLNF(torch.nn.Module):
 
         self.flow = nf.NormalizingFlow(base, flows)
 
+
+        if hom_layers > 0:
+            flows = []
+            for i in range(hom_layers):
+                # Neural network with two hidden layers having 64 units each
+                # Last layer is initialized by zeros making training more stable
+                param_map = nf.nets.MLP([half_dim, hom_hidden_dim, hom_hidden_dim, input_dim], init_zeros=True)
+                # Add flow layer
+                flows.append(nf.flows.AffineCouplingBlock(param_map, scale_map=scale_map))
+                # Swap dimensions
+                flows.append(nf.flows.Permute(input_dim, mode='swap'))
+
+            self.hom = nf.NormalizingFlow(base, flows)
+        else:
+            self.hom = None
+
         if num_bases_sym is None:
             self.W_sym = None
         else:
@@ -443,20 +461,27 @@ class CLNF(torch.nn.Module):
 
     def parameters(self, recurse = True):
         yield from self.flow.parameters(recurse)
+        if self.hom is not None:
+            yield from self.hom.parameters(recurse)
         if self.W_sym is not None:
             yield self.W_sym
         if self.W_null is not None:
             yield self.W_null
 
     def encode(self, x):
-        z = self.autoencoder.encode(x)
-        z = z.reshape(z.size(0), -1)
-        return self.flow.inverse(z)
+        y = self.autoencoder.encode(x)
+        y = y.reshape(y.size(0), -1)
+        z = self.flow.inverse(y)
+        if self.hom is not None:
+            z = self.hom.inverse(z)
+        return z
 
     def decode(self, z):
-        z = self.flow.forward(z)
-        z = z.reshape(z.size(0), -1, 1, 1)
-        x = self.autoencoder.decode(z)
+        if self.hom is not None:
+            z = self.hom.forward(z)
+        y = self.flow.forward(z)
+        y = y.reshape(y.size(0), -1, 1, 1)
+        x = self.autoencoder.decode(y)
         return x
     
     def _predict(self, x: torch.Tensor):
@@ -476,6 +501,15 @@ class CLNF(torch.nn.Module):
         y = y.reshape(1, -1, 1, 1)
         x = self.autoencoder.decode(y)
         return x.squeeze(0)
+    
+    def _forward_flow(self, z: torch.Tensor):
+        # z: (input_dim,)
+        # Returns: (output_dim,)
+        z = z.unsqueeze(0)
+        if self.hom is not None:
+            z = self.hom.forward(z)
+        y = self.flow.forward(z)
+        return y.squeeze(0)
     
     def sample_cotangent(self, x: torch.Tensor, cv: torch.Tensor):
         def _sample_cotangent_single(x: torch.Tensor, cv: torch.Tensor):
@@ -511,14 +545,11 @@ class CLNF(torch.nn.Module):
 
     def pullback_cotangent(self, z: torch.Tensor, cv: torch.Tensor):
         def _pullback_cotangent_single(z: torch.Tensor, cv: torch.Tensor):
-            z = z.unsqueeze(0)
-            cv = cv.unsqueeze(0)
-
-            _, vjp_fn = torch.func.vjp(self.flow.forward, z)
+            _, vjp_fn = torch.func.vjp(self._forward_flow, z)
 
             cv = vjp_fn(cv)[0]
 
-            return cv.squeeze(0)
+            return cv
 
         cv = torch.func.vmap(_pullback_cotangent_single)(z, cv)
 
@@ -583,6 +614,8 @@ class CLNF(torch.nn.Module):
         y = y.detach().reshape(y.size(0), -1)
         z, logdet = self.flow.inverse_and_log_det(y)
         log_prob_data = self.flow.q0.log_prob(z) + logdet  # (B,)
+        if self.hom is not None:
+            z = self.hom.inverse(z)
 
         cv = torch.randn(x.size(0), 12, device=x.device)  # (B, output_dim)
         cv = self.sample_cotangent(x.detach(), cv)  # (B, input_dim)
@@ -624,6 +657,30 @@ class CLNF(torch.nn.Module):
 
             output_dict.update(log_prob_sym=log_prob_sym)
 
+            if self.hom is not None:
+                y_sample, _ = self.flow.sample(z.size(0))
+                logp1 = self.flow.log_prob(y_sample)
+                kl_sym = logp1
+                z_sample, logdet1 = self.flow.inverse_and_log_det(y_sample)
+                kl_sym = kl_sym - logdet1
+                z_sample, logdet2 = self.hom.inverse_and_log_det(z_sample)
+                kl_sym = kl_sym - logdet2
+                eps = torch.randn(z.size(0), self.num_bases_sym, device=z.device) / self.num_bases_sym
+                A = torch.eye(self.latent_dim, device=z.device) + torch.einsum('bm,mji->bji', eps, L)
+                z_sample = torch.einsum('bji,bi->bj', A, z_sample)
+                logdet3 = A.logdet()
+                kl_sym = kl_sym - logdet3
+                z_sample, logdet4 = self.hom.forward_and_log_det(z_sample)
+                kl_sym = kl_sym - logdet4
+                y_sample, logdet5 = self.flow.forward_and_log_det(z_sample)
+                kl_sym = kl_sym - logdet5
+                logp2 = self.flow.log_prob(y_sample)
+                kl_sym = kl_sym - logp2
+
+                kl_sym = kl_sym.clamp(min=0.0, max=10.0)
+
+                output_dict.update(kl_sym=kl_sym)
+
         if self.W_null is not None:
             L = (self.W_null - self.W_null.mT) / 2  # (num_bases, input_dim, input_dim)
             if self.normalize_generators:
@@ -635,6 +692,31 @@ class CLNF(torch.nn.Module):
 
             output_dict.update(log_prob_null=log_prob_null)
 
+            if self.hom is not None:
+                y_sample, _ = self.flow.sample(z.size(0))
+                logp1 = self.flow.log_prob(y_sample)
+                kl_null = logp1
+                z_sample, logdet1 = self.flow.inverse_and_log_det(y_sample)
+                kl_null = kl_null - logdet1
+                z_sample, logdet2 = self.hom.inverse_and_log_det(z_sample)
+                kl_null = kl_null - logdet2
+                eps = torch.randn(z.size(0), self.num_bases_null, device=z.device) / self.num_bases_null
+                A = torch.eye(self.latent_dim, device=z.device) + torch.einsum('bm,mji->bji', eps, L)
+                z_sample = torch.einsum('bji,bi->bj', A, z_sample)
+                logdet3 = A.logdet()
+                kl_null = kl_null - logdet3
+                z_sample, logdet4 = self.hom.forward_and_log_det(z_sample)
+                kl_null = kl_null - logdet4
+                y_sample, logdet5 = self.flow.forward_and_log_det(z_sample)
+                kl_null = kl_null - logdet5
+                logp2 = self.flow.log_prob(y_sample)
+                kl_null = kl_null - logp2
+
+                kl_null = kl_null.clamp(min=0.0, max=10.0)
+
+                output_dict.update(kl_null=kl_null)
+
+
         return output_dict
 
 
@@ -645,6 +727,8 @@ class CLNFModule(pl.LightningModule):
         ckpt_autoencoder: str,
         flow_layers=24,
         flow_hidden_dim=192,
+        hom_layers=0,
+        hom_hidden_dim=192,
         num_bases_sym=None,
         num_bases_null=None,
         scale_map="exp_clamp",
@@ -669,6 +753,8 @@ class CLNFModule(pl.LightningModule):
             ckpt_autoencoder,
             flow_layers=flow_layers,
             flow_hidden_dim=flow_hidden_dim,
+            hom_layers=hom_layers,
+            hom_hidden_dim=hom_hidden_dim,
             num_bases_sym=num_bases_sym,
             num_bases_null=num_bases_null,
             scale_map=scale_map,
@@ -717,7 +803,15 @@ class CLNFModule(pl.LightningModule):
             log_prob_null = output_dict['log_prob_null'].mean()
             self.log('train_log_prob_null', log_prob_null, on_step=False, on_epoch=True, prog_bar=False)
             loss = loss - log_prob_null
-        
+        if 'kl_sym' in output_dict:
+            kl_sym = output_dict['kl_sym'].mean()
+            self.log('train_kl_sym', kl_sym, on_step=False, on_epoch=True, prog_bar=False)
+            loss = loss + kl_sym
+        if 'kl_null' in output_dict:
+            kl_null = output_dict['kl_null'].mean()
+            self.log('train_kl_null', kl_null, on_step=False, on_epoch=True, prog_bar=False)
+            loss = loss + kl_null
+
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
     
@@ -738,6 +832,14 @@ class CLNFModule(pl.LightningModule):
             log_prob_null = output_dict['log_prob_null'].mean()
             self.log('val_log_prob_null', log_prob_null, on_step=False, on_epoch=True, prog_bar=False)
             loss = loss - log_prob_null
+        if 'kl_sym' in output_dict:
+            kl_sym = output_dict['kl_sym'].mean()
+            self.log('val_kl_sym', kl_sym, on_step=False, on_epoch=True, prog_bar=False)
+            loss = loss + kl_sym
+        if 'kl_null' in output_dict:
+            kl_null = output_dict['kl_null'].mean()
+            self.log('val_kl_null', kl_null, on_step=False, on_epoch=True, prog_bar=False)
+            loss = loss + kl_null
 
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
 

@@ -51,6 +51,8 @@ def main(args):
         ckpt_autoencoder=args.ckpt_autoencoder,
         flow_layers=args.flow_layers,
         flow_hidden_dim=args.flow_hidden_dim,
+        hom_layers=args.hom_layers,
+        hom_hidden_dim=args.hom_hidden_dim,
         scale_map=args.scale_map,
         num_bases_sym=args.num_bases_sym,
         num_bases_null=args.num_bases_null,
@@ -86,6 +88,8 @@ def main(args):
         ckpt_autoencoder=args.ckpt_autoencoder,
         flow_layers=args.flow_layers,
         flow_hidden_dim=args.flow_hidden_dim,
+        hom_layers=args.hom_layers,
+        hom_hidden_dim=args.hom_hidden_dim,
         scale_map=args.scale_map,
         num_bases_sym=args.num_bases_sym,
         num_bases_null=args.num_bases_null,
@@ -148,7 +152,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--removed_factors', type=str, nargs='+', default=[], help='Factors to remove from the dataset. Options: floor_hue, wall_hue, object_hue, scale, shape, orientation')
-    parser.add_argument('--predicted_factors', type=str, nargs='+', default=[], help='Factors to predict from the dataset. Options: floor_hue, wall_hue, object_hue, scale, shape, orientation')
+    parser.add_argument('--predicted_factors', type=str, nargs='+', default=['scale', 'shape'], help='Factors to predict from the dataset. Options: floor_hue, wall_hue, object_hue, scale, shape, orientation')
     parser.add_argument('--cut_factors', type=str, nargs='+', default=[], help='Factors to cut from the dataset. Options: floor_hue, wall_hue, object_hue, scale, shape, orientation')
 
     parser.add_argument('ckpt_predictor', type=str, help='Path to pretrained predictor checkpoint')
@@ -156,6 +160,8 @@ if __name__ == "__main__":
     # flow parameters
     parser.add_argument('--flow_layers', type=int, default=24, help='Number of layers in normalizing flow')
     parser.add_argument('--flow_hidden_dim', type=int, default=192, help='Hidden dimension of flow networks')
+    parser.add_argument('--hom_layers', type=int, default=0, help='Number of layers in homomorphic flow')
+    parser.add_argument('--hom_hidden_dim', type=int, default=192, help='Hidden dimension of homomorphic flow networks')
     parser.add_argument('--scale_map', type=str, default='exp_clamp', help='Scale map for flow (exp, exp_clamp)')
     # symmetry parameters
     parser.add_argument('--num_bases_sym', type=int, default=None, help='Number of bases for symmetric part')
