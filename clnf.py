@@ -63,6 +63,7 @@ def main(args):
         normalize_generators=args.normalize_generators,
         normalize_precision=args.normalize_precision,
         rescale_eps=args.rescale_eps,
+        fix_w_sym_to_commutative_rotation_basis=args.fix_w_sym_to_commutative_rotation_basis,
         lr=args.lr,
         sample_image=sample_image,
         sample_num=args.sample_num,
@@ -100,6 +101,7 @@ def main(args):
         normalize_generators=args.normalize_generators,
         normalize_precision=args.normalize_precision,
         rescale_eps=args.rescale_eps,
+        fix_w_sym_to_commutative_rotation_basis=args.fix_w_sym_to_commutative_rotation_basis,
         lr=args.lr,
         sample_num=args.sample_num,
         generator_num=args.generator_num,
@@ -173,6 +175,7 @@ if __name__ == "__main__":
     parser.add_argument('--normalize_generators', action='store_true', help='Whether to normalize generators during training')
     parser.add_argument('--normalize_precision', action='store_true', help='Whether to normalize precision matrices during training')
     parser.add_argument('--rescale_eps', action='store_true', help='Whether to rescale epsilons during training')
+    parser.add_argument('--fix_w_sym_to_commutative_rotation_basis', action='store_true', help='Fix W_sym to the commutative rotation basis instead of learning it')
     # plot parameters
     parser.add_argument('--sample_num', type=int, default=64, help='Number of generated images per validation')
     parser.add_argument('--generator_num', type=int, default=64, help='Number of generators to estimate')

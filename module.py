@@ -378,6 +378,7 @@ class CLNF(torch.nn.Module):
         normalize_generators=False,
         normalize_precision=False,
         rescale_eps=False,
+        fix_w_sym_to_commutative_rotation_basis=False,
         predicted_factors=['scale', 'shape'],
     ):
         super().__init__()
@@ -385,6 +386,7 @@ class CLNF(torch.nn.Module):
         self.normalize_generators = normalize_generators
         self.normalize_precision = normalize_precision
         self.rescale_eps = rescale_eps
+        self.fix_w_sym_to_commutative_rotation_basis = fix_w_sym_to_commutative_rotation_basis
 
         self.predictor = PredictorModule.load_from_checkpoint(ckpt_predictor).model.eval()
         self.autoencoder = AutoencoderModule.load_from_checkpoint(ckpt_autoencoder).model.eval()
@@ -430,7 +432,13 @@ class CLNF(torch.nn.Module):
         if num_bases_sym is None:
             self.W_sym = None
         else:
-            self.W_sym = torch.nn.Parameter(torch.randn(num_bases_sym, input_dim, input_dim) * (1.0 / math.sqrt(input_dim)))
+            if self.fix_w_sym_to_commutative_rotation_basis:
+                self.register_buffer(
+                    'W_sym',
+                    self._commutative_rotation_basis(input_dim, num_bases_sym),
+                )
+            else:
+                self.W_sym = torch.nn.Parameter(torch.randn(num_bases_sym, input_dim, input_dim) * (1.0 / math.sqrt(input_dim)))
             self.register_buffer('eps_p_sym', torch.tensor(eps_p_sym))
             self.register_buffer('eps_q_sym', torch.tensor(eps_q_sym))
         if num_bases_null is None:
@@ -458,6 +466,17 @@ class CLNF(torch.nn.Module):
                 self.predict_mask[7:11] = 1.0
             elif factor == 'orientation':
                 self.predict_mask[11:12] = 1.0
+
+    def _commutative_rotation_basis(self, latent_dim, num_bases):
+        basis = []
+        for k in range(num_bases):
+            mat = torch.zeros(latent_dim, latent_dim)
+            i = 2 * k
+            j = 2 * k + 1
+            if i < latent_dim and j < latent_dim:
+                mat[i, j] = 1.0
+                basis.append(mat)
+        return torch.stack(basis, dim=0)
 
     def parameters(self, recurse = True):
         yield from self.flow.parameters(recurse)
@@ -739,6 +758,7 @@ class CLNFModule(pl.LightningModule):
         normalize_generators=False,
         normalize_precision=False,
         rescale_eps=False,
+        fix_w_sym_to_commutative_rotation_basis=False,
         lr=1e-3,
         sample_image: torch.Tensor=None,
         sample_num=64,
@@ -765,6 +785,7 @@ class CLNFModule(pl.LightningModule):
             normalize_generators=normalize_generators,
             normalize_precision=normalize_precision,
             rescale_eps=rescale_eps,
+            fix_w_sym_to_commutative_rotation_basis=fix_w_sym_to_commutative_rotation_basis,
             predicted_factors=predicted_factors,
         )
 
