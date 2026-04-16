@@ -4,6 +4,7 @@ import torchvision as tv
 import wandb
 import normflows as nf
 import math
+from typing import Any
 from matplotlib import pyplot as plt
 
 class CustomError(Exception):
@@ -128,17 +129,26 @@ class AutoencoderModule(pl.LightningModule):
     def forward(self, x):
         return self.model(x)
 
+    def _extract_images(self, batch: Any) -> torch.Tensor:
+        if isinstance(batch, dict):
+            if "image" not in batch:
+                raise KeyError("Dictionary batch must contain key 'image' for autoencoder training.")
+            return batch["image"]
+        return batch
+
     def training_step(self, batch, batch_idx):
-        recon = self.model(batch)[1]
-        loss = torch.nn.functional.mse_loss(recon, batch)
+        imgs = self._extract_images(batch)
+        recon = self.model(imgs)[1]
+        loss = torch.nn.functional.mse_loss(recon, imgs)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        recon = self.model(batch)[1]
+        imgs = self._extract_images(batch)
+        recon = self.model(imgs)[1]
         if self.recon_imgs is None:
             self.recon_imgs = recon.clamp(0, 1).cpu()
-        loss = torch.nn.functional.mse_loss(recon, batch)
+        loss = torch.nn.functional.mse_loss(recon, imgs)
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 

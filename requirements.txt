@@ -1,4 +1,5 @@
 git+https://github.com/AtsushiMiyashita317/normalizing-flows.git
+git+https://github.com/AtsushiMiyashita317/differentiable_3dshapes.git
 h5py
 matplotlib
 numpy
