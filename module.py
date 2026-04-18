@@ -1107,3 +1107,163 @@ class CLNFModule(pl.LightningModule):
             #     'frequency': 1,
             # }
         }
+
+
+class CLNFSupervisedModule(CLNFModule):
+    """Supervised CLNF module for GT vector-field matching in latent space."""
+
+    def __init__(
+        self,
+        ckpt_predictor: str,
+        ckpt_autoencoder: str,
+        flow_layers=24,
+        flow_hidden_dim=192,
+        scale_map="exp_clamp",
+        normalize_generators=False,
+        lr=1e-3,
+        sample_num=64,
+        generator_num=16,
+        repr_dims=[7, 8, 9, 12],
+    ):
+        super().__init__(
+            ckpt_predictor=ckpt_predictor,
+            ckpt_autoencoder=ckpt_autoencoder,
+            flow_layers=flow_layers,
+            flow_hidden_dim=flow_hidden_dim,
+            hom_layers=0,
+            hom_hidden_dim=192,
+            num_bases_sym=4,
+            num_bases_null=None,
+            scale_map=scale_map,
+            eps_p_sym=1e-3,
+            eps_q_sym=1e-1,
+            eps_p_null=1e-3,
+            eps_q_null=1e-1,
+            normalize_generators=normalize_generators,
+            normalize_precision=False,
+            rescale_eps=False,
+            fix_w_sym_to_commutative_rotation_basis=False,
+            lr=lr,
+            sample_image=None,
+            sample_num=sample_num,
+            generator_num=generator_num,
+            repr_dims=repr_dims,
+            predicted_factors=["orientation", "floor_hue", "wall_hue", "object_hue"],
+        )
+
+        # Supervised setting: freeze autoencoder, learn flow and W_sym.
+        for p in self.model.autoencoder.parameters():
+            p.requires_grad = False
+        self.model.autoencoder.eval()
+
+        self._vis_image = None
+
+    @staticmethod
+    def _extract_images(batch: Any) -> torch.Tensor:
+        if not isinstance(batch, dict) or "image" not in batch:
+            raise KeyError("Supervised CLNF expects dict batch with key 'image'.")
+        return batch["image"]
+
+    @staticmethod
+    def _extract_jacobians(batch: Any):
+        if not isinstance(batch, dict) or "jacobians" not in batch:
+            raise KeyError("Supervised CLNF expects dict batch with key 'jacobians'.")
+        jacobians = batch["jacobians"]
+        if not isinstance(jacobians, tuple) or len(jacobians) != 5:
+            raise ValueError("Expected jacobians as tuple(size, orientation, floor, wall, object).")
+        # Exclude size and keep 4 factors: orientation, floor_hue, wall_hue, object_hue.
+        return jacobians[1], jacobians[2], jacobians[3], jacobians[4]
+
+    def _compute_supervised_loss(self, imgs: torch.Tensor, jac_tuple):
+        # Encode to latent flow space.
+        self.model.autoencoder.eval()
+        with torch.no_grad():
+            y = self.model.autoencoder.encode(imgs)
+            y = y.reshape(y.size(0), -1)
+        z, _ = self.model.flow.inverse_and_log_det(y)
+
+        # Pull GT image-space jacobians back to latent space.
+        gt_latent = []
+        for jac in jac_tuple:
+            cv = self.model.encode_cotangent(y, jac.detach())
+            cv = self.model.pullback_cotangent(z, cv)
+            gt_latent.append(cv)
+        gt_latent = torch.stack(gt_latent, dim=1)  # (B, 4, D)
+
+        # Predicted latent vector-field bases from generators.
+        if self.model.W_sym is None:
+            raise RuntimeError("W_sym is required for supervised CLNF training.")
+        L = (self.model.W_sym - self.model.W_sym.mT) / 2  # (4, D, D)
+        if self.model.normalize_generators:
+            L = L / L.square().mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6).sqrt()
+            L = L / L.size(-1) ** 0.5
+        pred_latent = torch.einsum('bi,mji->bmj', z, L)  # (B, 4, D)
+
+        pred_norm = torch.nn.functional.normalize(pred_latent, dim=-1, eps=1e-6)
+        gt_norm = torch.nn.functional.normalize(gt_latent, dim=-1, eps=1e-6)
+        cosine = (pred_norm * gt_norm).sum(dim=-1)  # (B, 4)
+        loss = (1.0 - cosine).mean()
+        cosine_mean = cosine.mean()
+
+        return loss, cosine_mean, cosine, z
+
+    def training_step(self, batch, batch_idx):
+        imgs = self._extract_images(batch)
+        jac_tuple = self._extract_jacobians(batch)
+        loss, cosine_mean, cosine_each, _ = self._compute_supervised_loss(imgs, jac_tuple)
+
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_cosine_mean', cosine_mean, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_cosine_orientation', cosine_each[:, 0].mean(), on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_cosine_floor_hue', cosine_each[:, 1].mean(), on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_cosine_wall_hue', cosine_each[:, 2].mean(), on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_cosine_object_hue', cosine_each[:, 3].mean(), on_step=False, on_epoch=True, prog_bar=False)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        imgs = self._extract_images(batch)
+        jac_tuple = self._extract_jacobians(batch)
+        loss, cosine_mean, cosine_each, z = self._compute_supervised_loss(imgs, jac_tuple)
+
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_cosine_mean', cosine_mean, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_cosine_orientation', cosine_each[:, 0].mean(), on_step=False, on_epoch=True, prog_bar=False)
+        self.log('val_cosine_floor_hue', cosine_each[:, 1].mean(), on_step=False, on_epoch=True, prog_bar=False)
+        self.log('val_cosine_wall_hue', cosine_each[:, 2].mean(), on_step=False, on_epoch=True, prog_bar=False)
+        self.log('val_cosine_object_hue', cosine_each[:, 3].mean(), on_step=False, on_epoch=True, prog_bar=False)
+
+        # Keep one validation sample for generator transform visualization.
+        if self._vis_image is None:
+            self._vis_image = imgs[:1].detach()
+        return loss
+
+    def on_validation_epoch_end(self):
+        if not hasattr(self.logger, "experiment"):
+            return
+        if self._vis_image is None:
+            return
+
+        try:
+            z = self.model.encode(self._vis_image)
+            s_sym, L_sym = self._align_estimated_generators(self.model.W_sym)
+            curve_sym = self.lie_algebra_loss_curve(L_sym)
+            self._plot_line(curve_sym, title="supervised/estimated/sym/lie_algebra_loss")
+            L_sym = L_sym[:self.generator_num]
+            self._plot_line(s_sym, title="supervised/estimated/sym/singular_values")
+            x_sym = self._transform(z, L_sym)
+            self._plot_samples(x_sym, nrow=9, title='supervised/estimated/sym')
+            self._plot_generators(L_sym, title="supervised/estimated/sym")
+        except Exception as e:
+            print(f"Failed to compute supervised estimated generators: {e}")
+
+        try:
+            self._plot_samples(self._sample(), nrow=8, title="supervised/sampled_images")
+        except Exception as e:
+            print(f"Failed to plot supervised sampled images: {e}")
+
+        self._vis_image = None
+
+    def configure_optimizers(self):
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adamax(params, lr=self.lr, weight_decay=3e-5)
+        return {'optimizer': optimizer}
