@@ -372,8 +372,8 @@ class NFModule(pl.LightningModule):
 class CLNF(torch.nn.Module):
     def __init__(
         self, 
-        ckpt_predictor,
-        ckpt_autoencoder,
+        ckpt_predictor=None,
+        ckpt_autoencoder=None,
         flow_layers=24,
         flow_hidden_dim=192,
         hom_layers=24,
@@ -398,7 +398,12 @@ class CLNF(torch.nn.Module):
         self.rescale_eps = rescale_eps
         self.fix_w_sym_to_commutative_rotation_basis = fix_w_sym_to_commutative_rotation_basis
 
-        self.predictor = PredictorModule.load_from_checkpoint(ckpt_predictor).model.eval()
+        if ckpt_predictor is not None:
+            self.predictor = PredictorModule.load_from_checkpoint(ckpt_predictor).model.eval()
+        else:
+            self.predictor = None
+        if ckpt_autoencoder is None:
+            raise ValueError("ckpt_autoencoder must be provided.")
         self.autoencoder = AutoencoderModule.load_from_checkpoint(ckpt_autoencoder).model.eval()
 
         self.latent_dim = self.autoencoder.latent_dim
@@ -516,6 +521,8 @@ class CLNF(torch.nn.Module):
     def _predict(self, x: torch.Tensor):
         # x: (3, 64, 64)
         # Returns: (output_dim,)
+        if self.predictor is None:
+            raise RuntimeError("Predictor is not loaded in this CLNF instance.")
         x = x.unsqueeze(0)
         color, scale, shape, orientation = self.predictor.forward(x)
         color = color.reshape(1, -1)
@@ -1114,7 +1121,6 @@ class CLNFSupervisedModule(CLNFModule):
 
     def __init__(
         self,
-        ckpt_predictor: str,
         ckpt_autoencoder: str,
         flow_layers=24,
         flow_hidden_dim=192,
@@ -1126,7 +1132,7 @@ class CLNFSupervisedModule(CLNFModule):
         repr_dims=[7, 8, 9, 12],
     ):
         super().__init__(
-            ckpt_predictor=ckpt_predictor,
+            ckpt_predictor=None,
             ckpt_autoencoder=ckpt_autoencoder,
             flow_layers=flow_layers,
             flow_hidden_dim=flow_hidden_dim,
@@ -1148,7 +1154,6 @@ class CLNFSupervisedModule(CLNFModule):
             sample_num=sample_num,
             generator_num=generator_num,
             repr_dims=repr_dims,
-            predicted_factors=["orientation", "floor_hue", "wall_hue", "object_hue"],
         )
 
         # Supervised setting: freeze autoencoder, learn flow and W_sym.
@@ -1205,12 +1210,32 @@ class CLNFSupervisedModule(CLNFModule):
         loss = (1.0 - cosine).mean()
         cosine_mean = cosine.mean()
 
-        return loss, cosine_mean, cosine, z
+        return loss, cosine_mean, cosine, z, pred_latent
+
+    @torch.no_grad()
+    def _update_stats_supervised(self, z: torch.Tensor, pred_latent: torch.Tensor):
+        # Treat each factor channel as an independent sample for analyzed/repr_dims statistics.
+        # z: (B, D), pred_latent: (B, 4, D)
+        b, m, d = pred_latent.shape
+        z_rep = z.detach().unsqueeze(1).expand(b, m, d).reshape(b * m, d)
+        cv_sym = pred_latent.detach().reshape(b * m, d)
+        cov_cotangent = torch.einsum('bi,bj->ij', cv_sym, cv_sym)
+        cov_sym = torch.einsum('bi,bj,bk,bl->ijkl', cv_sym, z_rep, cv_sym, z_rep)
+
+        if self.count == 0:
+            self.cov_cotangent = cov_cotangent
+            self.cov_sym = cov_sym
+            self.cov_null = None
+            self.count = z_rep.size(0)
+        else:
+            self.cov_cotangent.add_(cov_cotangent)
+            self.cov_sym.add_(cov_sym)
+            self.count += z_rep.size(0)
 
     def training_step(self, batch, batch_idx):
         imgs = self._extract_images(batch)
         jac_tuple = self._extract_jacobians(batch)
-        loss, cosine_mean, cosine_each, _ = self._compute_supervised_loss(imgs, jac_tuple)
+        loss, cosine_mean, cosine_each, _, _ = self._compute_supervised_loss(imgs, jac_tuple)
 
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('train_cosine_mean', cosine_mean, on_step=False, on_epoch=True, prog_bar=True)
@@ -1223,7 +1248,7 @@ class CLNFSupervisedModule(CLNFModule):
     def validation_step(self, batch, batch_idx):
         imgs = self._extract_images(batch)
         jac_tuple = self._extract_jacobians(batch)
-        loss, cosine_mean, cosine_each, z = self._compute_supervised_loss(imgs, jac_tuple)
+        loss, cosine_mean, cosine_each, z, pred_latent = self._compute_supervised_loss(imgs, jac_tuple)
 
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_cosine_mean', cosine_mean, on_step=False, on_epoch=True, prog_bar=True)
@@ -1231,6 +1256,7 @@ class CLNFSupervisedModule(CLNFModule):
         self.log('val_cosine_floor_hue', cosine_each[:, 1].mean(), on_step=False, on_epoch=True, prog_bar=False)
         self.log('val_cosine_wall_hue', cosine_each[:, 2].mean(), on_step=False, on_epoch=True, prog_bar=False)
         self.log('val_cosine_object_hue', cosine_each[:, 3].mean(), on_step=False, on_epoch=True, prog_bar=False)
+        self._update_stats_supervised(z, pred_latent)
 
         # Keep one validation sample for generator transform visualization.
         if self._vis_image is None:
@@ -1256,11 +1282,32 @@ class CLNFSupervisedModule(CLNFModule):
         except Exception as e:
             print(f"Failed to compute supervised estimated generators: {e}")
 
+        if self.cov_cotangent is not None:
+            try:
+                output_dict = self._project_covariance()
+                self._plot_line(output_dict['l'], title="supervised/analyzed/cotangent/eigenvalues")
+
+                for repr_dim in self.repr_dims:
+                    if 'cov_sym_proj' in output_dict:
+                        l_sym, generators_sym = self._compute_generators(
+                            output_dict['cov_sym_proj'], output_dict['basis'], repr_dim
+                        )
+                        curve_sym = self.lie_algebra_loss_curve(generators_sym)
+                        self._plot_line(curve_sym, title=f'supervised/analyzed/sym/repr_{repr_dim}/lie_algebra_loss')
+                        generators_sym = generators_sym[:self.generator_num]
+                        self._plot_line(l_sym, title=f'supervised/analyzed/sym/repr_{repr_dim}/eigenvalues')
+                        x_sym = self._transform(z, generators_sym)
+                        self._plot_samples(x_sym, nrow=9, title=f'supervised/analyzed/sym/repr_{repr_dim}')
+                        self._plot_generators(generators_sym, title=f'supervised/analyzed/sym/repr_{repr_dim}')
+            except Exception as e:
+                print(f"Failed to compute supervised analyzed generators: {e}")
+
         try:
             self._plot_samples(self._sample(), nrow=8, title="supervised/sampled_images")
         except Exception as e:
             print(f"Failed to plot supervised sampled images: {e}")
 
+        self._reset_stats()
         self._vis_image = None
 
     def configure_optimizers(self):

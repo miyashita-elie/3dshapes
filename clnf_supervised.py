@@ -35,7 +35,6 @@ def main(args):
     torch.manual_seed(args.seed_model)
 
     pl_model = CLNFSupervisedModule(
-        ckpt_predictor=args.ckpt_predictor,
         ckpt_autoencoder=args.ckpt_autoencoder,
         flow_layers=args.flow_layers,
         flow_hidden_dim=args.flow_hidden_dim,
@@ -51,7 +50,6 @@ def main(args):
 
     wandb_logger = WandbLogger(project=args.project, name=args.run_name)
     wandb_logger.log_hyperparams(dict(
-        ckpt_predictor=args.ckpt_predictor,
         ckpt_autoencoder=args.ckpt_autoencoder,
         flow_layers=args.flow_layers,
         flow_hidden_dim=args.flow_hidden_dim,
@@ -104,7 +102,6 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('ckpt_predictor', type=str, help='Path to pretrained predictor checkpoint')
     parser.add_argument('ckpt_autoencoder', type=str, help='Path to pretrained autoencoder checkpoint')
 
     parser.add_argument('--flow_layers', type=int, default=24, help='Number of layers in normalizing flow')
